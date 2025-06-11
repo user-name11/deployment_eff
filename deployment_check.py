@@ -13,9 +13,6 @@ import geopandas as gpd
 from shapely.geometry import Point
 import altair as alt
 import pydeck as pdk
-import sqlite3
-import os
-import math
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -30,249 +27,61 @@ dep_file = st.sidebar.file_uploader("1️⃣ Upload deployments CSV from https:/
 rides_file = st.sidebar.file_uploader("2️⃣ Upload rides CSV from https://bolt.cloud.looker.com/looks/3523", type="csv")
 geo_file = st.sidebar.file_uploader("3️⃣ Upload deployment zones (GeoJSON)", type=["geojson","json"])
 
-db_path = st.sidebar.text_input(
-    "📂 Enter path for local SQLite DB",
-    value="",
-    help="Create a file with 'name.db' format in a local directory. "
-)
-# Expand '~' to the user’s home directory
-db_path = os.path.expanduser(db_path)
-# If the path is a directory, show error and stop
-if db_path and os.path.isdir(db_path):
-    st.error(
-        f"Path '{db_path}' is a directory. Please provide a full file path "
-        "(e.g. '/Users/bolt/Documents/deployment_efficiency.db')."
+
+# Only proceed once deployment zones (GeoJSON) and CSVs are provided
+if geo_file and dep_file and rides_file:
+    # Read and preprocess deployments
+    deps = pd.read_csv(dep_file, parse_dates=["Created Time"])
+    deps = deps.query("`Action Type` == 'deploy' and `Action State` == 'completed'")
+    deps = deps.reset_index(drop=False).rename(columns={"index": "deploy_idx"})
+
+    # Load and buffer zones
+    zones = gpd.read_file(geo_file).to_crs(epsg=3857)
+    zones["geometry"] = zones.geometry.buffer(50)
+    zones = zones.to_crs(epsg=4326)
+
+    # Spatial join deployments to zones
+    deps["geometry"] = deps.apply(
+        lambda r: Point(r["Charger Lng"], r["Charger Lat"]), axis=1
     )
-    st.stop()
-# Append '.db' extension if missing
-if db_path and not os.path.splitext(db_path)[1]:
-    db_path = db_path + ".db"
-# Ensure the directory for the DB exists
-if db_path:
-    db_dir = os.path.dirname(db_path)
-    if db_dir and not os.path.exists(db_dir):
-        os.makedirs(db_dir, exist_ok=True)
+    deps_gdf = gpd.GeoDataFrame(deps, geometry="geometry", crs="EPSG:4326")
+    deps_with_zone = gpd.sjoin(
+        deps_gdf, zones[["name","geometry"]], how="left", predicate="within"
+    )
 
-# Only proceed once deployment zones (GeoJSON) are provided
-if geo_file:
-    # If a DB path is specified, use the SQLite-backed approach
-    if db_path:
-        # Connect to (or create) the SQLite DB
-        try:
-            conn = sqlite3.connect(db_path)
-        except sqlite3.OperationalError as e:
-            st.error(f"Unable to open or create database at '{db_path}': {e}")
-            st.stop()
+    # Read and merge rides
+    rides = pd.read_csv(rides_file, parse_dates=["Created Time"]).rename(
+        columns={"Created Time": "ride_time"}
+    )
+    merged = deps_with_zone.merge(
+        rides[["Uuid","ride_time","Vehicle Type Scooter or Bike"]],
+        on="Uuid", how="left"
+    )
+    merged = merged[merged["ride_time"] >= merged["Created Time"]]
+    first_rides = merged.sort_values("ride_time").groupby(
+        "deploy_idx", as_index=False
+    ).first()
+    first_rides["time_to_first_ride"] = (
+        first_rides["ride_time"] - first_rides["Created Time"]
+    )
 
-        # Create tables if they don't exist (deduplicated by PRIMARY KEY)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS deployments (
-            "Unnamed: 0" TEXT,
-            Country TEXT,
-            City TEXT,
-            "Created Date" TEXT,
-            "Created Time" TEXT,
-            "Action Type" TEXT,
-            "Charger ID" TEXT,
-            Name TEXT,
-            "Action State" TEXT,
-            "Vehicle ID" TEXT,
-            Uuid TEXT,
-            "Failure Reason" TEXT,
-            ID TEXT PRIMARY KEY,
-            "Charger Lat" REAL,
-            "Charger Lng" REAL,
-            "Count Vehicles" INTEGER
-        )
-        """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS rides (
-            "Unnamed: 0" TEXT,
-            ID TEXT PRIMARY KEY,
-            "Created Time" TEXT,
-            "Pickup Lat" REAL,
-            "Pickup Lng" REAL,
-            "Dropoff Lat" REAL,
-            "Dropoff Lng" REAL,
-            "Order Duration, minutes" REAL,
-            "Vehicle Type" TEXT,
-            "Vehicle Type Scooter or Bike" TEXT,
-            "Battery At Start" REAL,
-            "Battery In End" REAL,
-            "Order Distance" REAL,
-            "Finish Reason" TEXT,
-            Uuid TEXT,
-            "User ID" TEXT,
-            "User Type" TEXT,
-            "Order Finished Time" TEXT,
-            "Sum of Price Eur" REAL
-        )
-        """)
-        conn.commit()
-
-        # If deployment CSV is uploaded, append new rows to DB
-        if dep_file:
-            df_dep = pd.read_csv(dep_file, parse_dates=["Created Time"])
-            df_dep = df_dep.astype({
-                "Unnamed: 0": str, "Country": str, "City": str,
-                "Created Date": str, "Created Time": str,
-                "Action Type": str, "Charger ID": str, "Name": str,
-                "Action State": str, "Vehicle ID": str, "Uuid": str,
-                "Failure Reason": str, "ID": str,
-                "Charger Lat": float, "Charger Lng": float,
-                "Count Vehicles": int
-            }, errors='ignore')
-            cols_dep = [
-                "Unnamed: 0","Country","City","Created Date","Created Time",
-                "Action Type","Charger ID","Name","Action State","Vehicle ID",
-                "Uuid","Failure Reason","ID","Charger Lat","Charger Lng","Count Vehicles"
-            ]
-            quoted_cols_dep = [f'"{c}"' for c in cols_dep]
-            insert_dep_sql = (
-                f'INSERT OR IGNORE INTO deployments ({",".join(quoted_cols_dep)}) '
-                f'VALUES ({",".join(["?"]*len(quoted_cols_dep))})'
-            )
-            conn.executemany(
-                insert_dep_sql,
-                df_dep[cols_dep].astype(object).values.tolist()
-            )
-            conn.commit()
-
-        # If rides CSV is uploaded, append new rows to DB
-        if rides_file:
-            df_ride = pd.read_csv(rides_file, parse_dates=["Created Time"])
-            df_ride = df_ride.astype({
-                "Unnamed: 0": str, "ID": str, "Created Time": str,
-                "Pickup Lat": float, "Pickup Lng": float,
-                "Dropoff Lat": float, "Dropoff Lng": float,
-                "Order Duration, minutes": float, "Vehicle Type": str,
-                "Vehicle Type Scooter or Bike": str, "Battery At Start": float,
-                "Battery In End": float, "Order Distance": float,
-                "Finish Reason": str, "Uuid": str, "User ID": str,
-                "User Type": str, "Order Finished Time": str,
-                "Sum of Price Eur": float
-            }, errors='ignore')
-            cols_ride = [
-                "Unnamed: 0","ID","Created Time","Pickup Lat","Pickup Lng",
-                "Dropoff Lat","Dropoff Lng","Order Duration, minutes",
-                "Vehicle Type","Vehicle Type Scooter or Bike","Battery At Start",
-                "Battery In End","Order Distance","Finish Reason","Uuid",
-                "User ID","User Type","Order Finished Time","Sum of Price Eur"
-            ]
-            quoted_cols_ride = [f'"{c}"' for c in cols_ride]
-            insert_ride_sql = (
-                f'INSERT OR IGNORE INTO rides ({",".join(quoted_cols_ride)}) '
-                f'VALUES ({",".join(["?"]*len(quoted_cols_ride))})'
-            )
-            conn.executemany(
-                insert_ride_sql,
-                df_ride[cols_ride].astype(object).values.tolist()
-            )
-            conn.commit()
-
-        # Load from DB for processing
-        deps_db = pd.read_sql("SELECT * FROM deployments", conn, parse_dates=["Created Time"])
-        rides_db = pd.read_sql("SELECT * FROM rides", conn, parse_dates=["Created Time"])
-
-        deps = deps_db.query("`Action Type` == 'deploy' and `Action State` == 'completed'")
-        deps = deps.reset_index(drop=False).rename(columns={"index": "deploy_idx"})
-
-        zones = gpd.read_file(geo_file).to_crs(epsg=3857)
-        zones["geometry"] = zones.geometry.buffer(50)
-        zones = zones.to_crs(epsg=4326)
-
-        deps["geometry"] = deps.apply(
-            lambda r: Point(r["Charger Lng"], r["Charger Lat"]), axis=1
-        )
-        deps_gdf = gpd.GeoDataFrame(deps, geometry="geometry", crs="EPSG:4326")
-        deps_with_zone = gpd.sjoin(
-            deps_gdf, zones[["name","geometry"]], how="left", predicate="within"
-        )
-
-        merged = deps_with_zone.merge(
-            rides_db.rename(columns={"Created Time": "ride_time"})[
-                ["Uuid","ride_time","Vehicle Type Scooter or Bike"]
-            ],
-            on="Uuid", how="left"
-        )
-        merged = merged[merged["ride_time"] >= merged["Created Time"]]
-        first_rides = merged.sort_values("ride_time").groupby(
-            "deploy_idx", as_index=False
-        ).first()
-        first_rides["time_to_first_ride"] = (
-            first_rides["ride_time"] - first_rides["Created Time"]
-        )
-
-        result = first_rides[[
-            "Uuid","Created Date","Created Time","ride_time","name",
-            "Vehicle Type Scooter or Bike","time_to_first_ride"
-        ]].rename(columns={
-            "Created Date": "Deployment Date",
-            "Created Time": "Deployment Time",
-            "ride_time": "First Ride Time",
-            "name": "Deployment Spot",
-            "Vehicle Type Scooter or Bike": "Vehicle Model",
-            "time_to_first_ride": "Time to First Ride"
-        })
-        result["Time to First Ride Hours"] = (
-            result["Time to First Ride"].dt.total_seconds().div(3600)
-        )
-
-    # If no DB path is provided, use CSVs directly
-    elif dep_file and rides_file:
-        # Read and preprocess deployments from uploaded CSV
-        deps = pd.read_csv(dep_file, parse_dates=["Created Time"])
-        deps = deps.query("`Action Type` == 'deploy' and `Action State` == 'completed'")
-        deps = deps.reset_index(drop=False).rename(columns={"index": "deploy_idx"})
-
-        zones = gpd.read_file(geo_file).to_crs(epsg=3857)
-        zones["geometry"] = zones.geometry.buffer(50)
-        zones = zones.to_crs(epsg=4326)
-
-        deps["geometry"] = deps.apply(
-            lambda r: Point(r["Charger Lng"], r["Charger Lat"]), axis=1
-        )
-        deps_gdf = gpd.GeoDataFrame(deps, geometry="geometry", crs="EPSG:4326")
-        deps_with_zone = gpd.sjoin(
-            deps_gdf, zones[["name","geometry"]], how="left", predicate="within"
-        )
-
-        rides = pd.read_csv(rides_file, parse_dates=["Created Time"]).rename(
-            columns={"Created Time": "ride_time"}
-        )
-        merged = deps_with_zone.merge(
-            rides[["Uuid","ride_time","Vehicle Type Scooter or Bike"]],
-            on="Uuid", how="left"
-        )
-        merged = merged[merged["ride_time"] >= merged["Created Time"]]
-        first_rides = merged.sort_values("ride_time").groupby(
-            "deploy_idx", as_index=False
-        ).first()
-        first_rides["time_to_first_ride"] = (
-            first_rides["ride_time"] - first_rides["Created Time"]
-        )
-
-        result = first_rides[[
-            "Uuid","Created Date","Created Time","ride_time","name",
-            "Vehicle Type Scooter or Bike","time_to_first_ride"
-        ]].rename(columns={
-            "Created Date": "Deployment Date",
-            "Created Time": "Deployment Time",
-            "ride_time": "First Ride Time",
-            "name": "Deployment Spot",
-            "Vehicle Type Scooter or Bike": "Vehicle Model",
-            "time_to_first_ride": "Time to First Ride"
-        })
-        result["Time to First Ride Hours"] = (
-            result["Time to First Ride"].dt.total_seconds().div(3600)
-        )
-
-        deps_with_zone = deps_with_zone  # Already defined above
-    else:
-        st.info("Please upload both deployments and rides CSVs, and a GeoJSON file.")
-        st.stop()
+    # Build result table
+    result = first_rides[[
+        "Uuid","Created Date","Created Time","ride_time","name",
+        "Vehicle Type Scooter or Bike","time_to_first_ride"
+    ]].rename(columns={
+        "Created Date": "Deployment Date",
+        "Created Time": "Deployment Time",
+        "ride_time": "First Ride Time",
+        "name": "Deployment Spot",
+        "Vehicle Type Scooter or Bike": "Vehicle Model",
+        "time_to_first_ride": "Time to First Ride"
+    })
+    result["Time to First Ride Hours"] = (
+        result["Time to First Ride"].dt.total_seconds().div(3600)
+    )
 else:
-    st.info("Please upload the deployment zones GeoJSON file to proceed.")
+    st.info("Please upload deployments CSV, rides CSV, and deployment zones GeoJSON.")
     st.stop()
 
 # ───────────────────────────────────────────────────────────────────────────
