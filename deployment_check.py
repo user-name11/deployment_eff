@@ -33,7 +33,7 @@ geo_file = st.sidebar.file_uploader("3️⃣ Upload deployment zones (GeoJSON)",
 db_path = st.sidebar.text_input(
     "📂 Enter path for local SQLite DB",
     value="",
-    help="Create a file wiht name.db format in a local directory. "
+    help="Create a file with 'name.db' format in a local directory. "
 )
 # Expand '~' to the user’s home directory
 db_path = os.path.expanduser(db_path)
